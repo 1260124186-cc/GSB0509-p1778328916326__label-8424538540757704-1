@@ -1,0 +1,27 @@
+name: works-344
+services:
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: christmas-tree-3d
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - app-network
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 128M
+
+networks:
+  app-network:
+    driver: bridge
