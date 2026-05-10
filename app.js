@@ -23,7 +23,13 @@ const state = {
     targetScale: 1,
     isResourcesLoaded: false,
     lastGestureTime: 0,
-    gestureCooldown: 300 // ms
+    gestureCooldown: 300, // ms
+    // Two hands pinch control for nebula particle range
+    isTwoHandsPinching: false,
+    twoHandsDistance: 0.5,
+    twoHandsPrevDistance: 0.5,
+    targetNebulaScale: 1,
+    initialNebulaPositions: null
 };
 
 // ===== Color Themes =====
@@ -115,8 +121,9 @@ let particleSystem, particleMaterial;
 let particles = [];
 const PARTICLE_COUNT = 8000;
 
-// Store initial tree positions (fixed, calculated once at startup)
+// Store initial positions (fixed, calculated once at startup)
 let initialTreePositions = null;
+let initialNebulaPositions = null;
 
 // ===== MediaPipe Hands Setup =====
 let hands, videoElement, cameraInstance;
@@ -457,7 +464,7 @@ async function initHandGesture() {
         });
 
         hands.setOptions({
-            maxNumHands: 1,
+            maxNumHands: 2,
             modelComplexity: 0, // Use lite model for better performance
             minDetectionConfidence: 0.7,
             minTrackingConfidence: 0.5
@@ -488,10 +495,18 @@ async function initHandGesture() {
 function onHandResults(results) {
     if (!results.multiHandLandmarks || results.multiHandLandmarks.length === 0) {
         state.lastGesture = null;
+        state.isTwoHandsPinching = false;
         updateGestureIndicator('🤚', '等待手势...');
         return;
     }
 
+    // Handle two hands pinch gesture for nebula scale control
+    if (results.multiHandLandmarks.length === 2 && state.currentMode === 'nebula') {
+        handleTwoHandsPinch(results.multiHandLandmarks[0], results.multiHandLandmarks[1]);
+        return;
+    }
+
+    // Single hand gesture recognition
     const landmarks = results.multiHandLandmarks[0];
 
     // Update hand position for rotation control
@@ -632,6 +647,68 @@ function handlePalmMovement() {
     state.targetScale = Math.max(0.5, Math.min(2, 1 + zDelta));
 }
 
+function handleTwoHandsPinch(hand1Landmarks, hand2Landmarks) {
+    // Get thumb and index finger tips from both hands
+    const hand1Thumb = hand1Landmarks[4];
+    const hand1Index = hand1Landmarks[8];
+    const hand2Thumb = hand2Landmarks[4];
+    const hand2Index = hand2Landmarks[8];
+
+    // Check if both hands are pinching (thumb and index close together)
+    const isHand1Pinching = Math.sqrt(
+        Math.pow(hand1Thumb.x - hand1Index.x, 2) +
+        Math.pow(hand1Thumb.y - hand1Index.y, 2)
+    ) < 0.08;
+
+    const isHand2Pinching = Math.sqrt(
+        Math.pow(hand2Thumb.x - hand2Index.x, 2) +
+        Math.pow(hand2Thumb.y - hand2Index.y, 2)
+    ) < 0.08;
+
+    if (isHand1Pinching && isHand2Pinching) {
+        // Both hands are pinching - start tracking two hands gesture
+        state.isTwoHandsPinching = true;
+
+        // Calculate center point between the two pinching hands
+        const hand1Center = {
+            x: (hand1Thumb.x + hand1Index.x) / 2,
+            y: (hand1Thumb.y + hand1Index.y) / 2
+        };
+
+        const hand2Center = {
+            x: (hand2Thumb.x + hand2Index.x) / 2,
+            y: (hand2Thumb.y + hand2Index.y) / 2
+        };
+
+        // Calculate distance between the two pinch centers
+        state.twoHandsPrevDistance = state.twoHandsDistance;
+        state.twoHandsDistance = Math.sqrt(
+            Math.pow(hand1Center.x - hand2Center.x, 2) +
+            Math.pow(hand1Center.y - hand2Center.y, 2)
+        );
+
+        // Map distance to nebula scale:
+        // - Smaller distance (pinch closer) = smaller scale
+        // - Larger distance (pinch farther) = larger scale
+        // Range: 0.3 (tightest) to 2.0 (widest)
+        const minDist = 0.05;
+        const maxDist = 0.6;
+        const normalizedDist = Math.max(minDist, Math.min(maxDist, state.twoHandsDistance));
+        const scaleRange = 2.0 - 0.3;
+        state.targetNebulaScale = 0.3 + ((normalizedDist - minDist) / (maxDist - minDist)) * scaleRange;
+
+        // Update indicator
+        const scalePercent = Math.round(((state.targetNebulaScale - 0.3) / 1.7) * 100);
+        updateGestureIndicator('✋✋', `星云扩散: ${scalePercent}%`);
+    } else {
+        // Not pinching with both hands
+        if (state.isTwoHandsPinching) {
+            // Just released pinch - keep current scale
+            state.isTwoHandsPinching = false;
+        }
+    }
+}
+
 // ===== Mode Transitions =====
 function transitionToTree() {
     if (state.currentMode === 'tree') return;
@@ -663,13 +740,25 @@ function transitionToNebula() {
 
     hideModals();
 
+    // Reset nebula scale to default
+    state.targetNebulaScale = 1;
+
+    // Initialize and store nebula positions (calculated once)
+    if (initialNebulaPositions === null) {
+        initialNebulaPositions = new Float32Array(PARTICLE_COUNT * 3);
+        for (let i = 0; i < PARTICLE_COUNT; i++) {
+            const nebulaPos = getNebulaPosition();
+            initialNebulaPositions[i * 3] = nebulaPos.x;
+            initialNebulaPositions[i * 3 + 1] = nebulaPos.y;
+            initialNebulaPositions[i * 3 + 2] = nebulaPos.z;
+        }
+    }
+
     const targetPositions = particleSystem.geometry.attributes.targetPosition.array;
 
-    for (let i = 0; i < PARTICLE_COUNT; i++) {
-        const nebulaPos = getNebulaPosition();
-        targetPositions[i * 3] = nebulaPos.x;
-        targetPositions[i * 3 + 1] = nebulaPos.y;
-        targetPositions[i * 3 + 2] = nebulaPos.z;
+    // Copy initial nebula positions to target (will be scaled in updateNebulaScale)
+    for (let i = 0; i < PARTICLE_COUNT * 3; i++) {
+        targetPositions[i] = initialNebulaPositions[i];
     }
 
     particleSystem.geometry.attributes.targetPosition.needsUpdate = true;
@@ -816,6 +905,11 @@ function animate() {
     // Update shader time
     particleMaterial.uniforms.time.value = time;
 
+    // Update nebula scale based on two-hand pinch
+    if (state.currentMode === 'nebula') {
+        updateNebulaScale();
+    }
+
     // Smooth particle transitions
     updateParticlePositions();
 
@@ -823,6 +917,24 @@ function animate() {
     applyTransformations(time);
 
     renderer.render(scene, camera);
+}
+
+function updateNebulaScale() {
+    if (initialNebulaPositions === null) return;
+
+    const targetPositions = particleSystem.geometry.attributes.targetPosition.array;
+    const scale = state.targetNebulaScale;
+
+    // Apply scale to all nebula particles based on their initial positions
+    for (let i = 0; i < PARTICLE_COUNT; i++) {
+        const i3 = i * 3;
+        // Scale from origin (0,0,0) to create expansion/contraction effect
+        targetPositions[i3] = initialNebulaPositions[i3] * scale;
+        targetPositions[i3 + 1] = initialNebulaPositions[i3 + 1] * scale;
+        targetPositions[i3 + 2] = initialNebulaPositions[i3 + 2] * scale;
+    }
+
+    particleSystem.geometry.attributes.targetPosition.needsUpdate = true;
 }
 
 function updateParticlePositions() {
