@@ -10,7 +10,7 @@ const Camera = window.Camera;
 
 // ===== Global State =====
 const state = {
-    currentMode: 'tree', // 'tree' | 'nebula'
+    currentMode: 'tree',
     currentTheme: 0,
     isPhotoShown: false,
     isLetterShown: false,
@@ -23,7 +23,10 @@ const state = {
     targetScale: 1,
     isResourcesLoaded: false,
     lastGestureTime: 0,
-    gestureCooldown: 300 // ms
+    gestureCooldown: 300,
+    pinchSpreadFactor: 1.0,
+    targetPinchSpreadFactor: 1.0,
+    initialHandDistance: null
 };
 
 // ===== Color Themes =====
@@ -115,7 +118,8 @@ let particleSystem, particleMaterial;
 let particles = [];
 const PARTICLE_COUNT = 8000;
 
-// Store initial tree positions (fixed, calculated once at startup)
+let nebulaBasePositions = null;
+
 let initialTreePositions = null;
 
 // ===== MediaPipe Hands Setup =====
@@ -457,8 +461,8 @@ async function initHandGesture() {
         });
 
         hands.setOptions({
-            maxNumHands: 1,
-            modelComplexity: 0, // Use lite model for better performance
+            maxNumHands: 2,
+            modelComplexity: 0,
             minDetectionConfidence: 0.7,
             minTrackingConfidence: 0.5
         });
@@ -488,13 +492,37 @@ async function initHandGesture() {
 function onHandResults(results) {
     if (!results.multiHandLandmarks || results.multiHandLandmarks.length === 0) {
         state.lastGesture = null;
+        state.initialHandDistance = null;
         updateGestureIndicator('🤚', '等待手势...');
         return;
     }
 
+    if (results.multiHandLandmarks.length >= 2 && state.currentMode === 'nebula') {
+        const hand1 = results.multiHandLandmarks[0];
+        const hand2 = results.multiHandLandmarks[1];
+        const palm1 = hand1[9];
+        const palm2 = hand2[9];
+
+        const dx = palm1.x - palm2.x;
+        const dy = palm1.y - palm2.y;
+        const currentDist = Math.sqrt(dx * dx + dy * dy);
+
+        if (state.initialHandDistance === null) {
+            state.initialHandDistance = currentDist;
+        }
+
+        const ratio = currentDist / state.initialHandDistance;
+        state.targetPinchSpreadFactor = Math.max(0.15, Math.min(2.5, ratio));
+
+        updateGestureIndicator('🤏', `扩散: ${Math.round(state.targetPinchSpreadFactor * 100)}%`);
+        state.lastGesture = 'pinch';
+        return;
+    }
+
+    state.initialHandDistance = null;
+
     const landmarks = results.multiHandLandmarks[0];
 
-    // Update hand position for rotation control
     const wrist = landmarks[0];
     state.prevHandPosition = { ...state.handPosition };
     state.handPosition = {
@@ -503,7 +531,6 @@ function onHandResults(results) {
         z: wrist.z || 0.5
     };
 
-    // Recognize gesture
     const gesture = recognizeGesture(landmarks);
 
     if (gesture && gesture !== state.lastGesture) {
@@ -516,7 +543,6 @@ function onHandResults(results) {
 
     state.lastGesture = gesture;
 
-    // Handle palm movement for nebula rotation
     if (gesture === 'palm' && state.currentMode === 'nebula') {
         handlePalmMovement();
     }
@@ -663,10 +689,19 @@ function transitionToNebula() {
 
     hideModals();
 
+    state.targetPinchSpreadFactor = 1.0;
+    state.pinchSpreadFactor = 1.0;
+    state.initialHandDistance = null;
+
+    nebulaBasePositions = new Float32Array(PARTICLE_COUNT * 3);
+
     const targetPositions = particleSystem.geometry.attributes.targetPosition.array;
 
     for (let i = 0; i < PARTICLE_COUNT; i++) {
         const nebulaPos = getNebulaPosition();
+        nebulaBasePositions[i * 3] = nebulaPos.x;
+        nebulaBasePositions[i * 3 + 1] = nebulaPos.y;
+        nebulaBasePositions[i * 3 + 2] = nebulaPos.z;
         targetPositions[i * 3] = nebulaPos.x;
         targetPositions[i * 3 + 1] = nebulaPos.y;
         targetPositions[i * 3 + 2] = nebulaPos.z;
@@ -674,7 +709,6 @@ function transitionToNebula() {
 
     particleSystem.geometry.attributes.targetPosition.needsUpdate = true;
 
-    // Hide star
     const star = scene.getObjectByName('star');
     if (star) star.visible = false;
 }
@@ -816,7 +850,8 @@ function animate() {
     // Update shader time
     particleMaterial.uniforms.time.value = time;
 
-    // Smooth particle transitions
+    updateNebulaSpread();
+
     updateParticlePositions();
 
     // Apply rotation and scale with smoothing
@@ -836,27 +871,22 @@ function updateParticlePositions() {
     for (let i = 0; i < PARTICLE_COUNT; i++) {
         const i3 = i * 3;
 
-        // Calculate direction to target
         const dx = targetPositions[i3] - positions[i3];
         const dy = targetPositions[i3 + 1] - positions[i3 + 1];
         const dz = targetPositions[i3 + 2] - positions[i3 + 2];
 
-        // Update velocities with spring-like behavior
         velocities[i3] += dx * lerpFactor;
         velocities[i3 + 1] += dy * lerpFactor;
         velocities[i3 + 2] += dz * lerpFactor;
 
-        // Apply damping
         velocities[i3] *= dampingFactor;
         velocities[i3 + 1] *= dampingFactor;
         velocities[i3 + 2] *= dampingFactor;
 
-        // Update positions
         positions[i3] += velocities[i3];
         positions[i3 + 1] += velocities[i3 + 1];
         positions[i3 + 2] += velocities[i3 + 2];
 
-        // Add subtle floating motion in nebula mode
         if (state.currentMode === 'nebula') {
             const offset = i * 0.01;
             positions[i3] += Math.sin(performance.now() * 0.0005 + offset) * 0.001;
@@ -865,6 +895,25 @@ function updateParticlePositions() {
     }
 
     particleSystem.geometry.attributes.position.needsUpdate = true;
+}
+
+function updateNebulaSpread() {
+    if (state.currentMode !== 'nebula' || !nebulaBasePositions) return;
+
+    const spreadSmoothing = 0.12;
+    state.pinchSpreadFactor += (state.targetPinchSpreadFactor - state.pinchSpreadFactor) * spreadSmoothing;
+
+    const targetPositions = particleSystem.geometry.attributes.targetPosition.array;
+    const factor = state.pinchSpreadFactor;
+
+    for (let i = 0; i < PARTICLE_COUNT; i++) {
+        const i3 = i * 3;
+        targetPositions[i3] = nebulaBasePositions[i3] * factor;
+        targetPositions[i3 + 1] = nebulaBasePositions[i3 + 1] * factor;
+        targetPositions[i3 + 2] = nebulaBasePositions[i3 + 2] * factor;
+    }
+
+    particleSystem.geometry.attributes.targetPosition.needsUpdate = true;
 }
 
 function applyTransformations(time) {
