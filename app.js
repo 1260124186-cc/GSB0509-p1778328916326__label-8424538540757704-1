@@ -118,6 +118,9 @@ const PARTICLE_COUNT = 8000;
 // Store initial tree positions (fixed, calculated once at startup)
 let initialTreePositions = null;
 
+// Store nebula base positions (normalized, used for spread calculation)
+let initialNebulaPositions = null;
+
 // ===== MediaPipe Hands Setup =====
 let hands, videoElement, cameraInstance;
 let isHandsInitialized = false;
@@ -193,6 +196,17 @@ function createParticleSystem() {
 
     // Initialize and store fixed tree positions (calculated once)
     initialTreePositions = new Float32Array(PARTICLE_COUNT * 3);
+
+    // Initialize and store nebula base positions (calculated once, normalized)
+    initialNebulaPositions = new Float32Array(PARTICLE_COUNT * 3);
+
+    // Pre-calculate nebula positions
+    for (let i = 0; i < PARTICLE_COUNT; i++) {
+        const nebulaPos = getNebulaPosition();
+        initialNebulaPositions[i * 3] = nebulaPos.x;
+        initialNebulaPositions[i * 3 + 1] = nebulaPos.y;
+        initialNebulaPositions[i * 3 + 2] = nebulaPos.z;
+    }
 
     // Initialize particles in tree formation
     for (let i = 0; i < PARTICLE_COUNT; i++) {
@@ -457,7 +471,7 @@ async function initHandGesture() {
         });
 
         hands.setOptions({
-            maxNumHands: 1,
+            maxNumHands: 2,
             modelComplexity: 0, // Use lite model for better performance
             minDetectionConfidence: 0.7,
             minTrackingConfidence: 0.5
@@ -488,9 +502,21 @@ async function initHandGesture() {
 function onHandResults(results) {
     if (!results.multiHandLandmarks || results.multiHandLandmarks.length === 0) {
         state.lastGesture = null;
+        state.isTwoHandPinch = false;
         updateGestureIndicator('🤚', '等待手势...');
         return;
     }
+
+    // Check for two-hand pinch gesture first
+    if (results.multiHandLandmarks.length >= 2 && state.currentMode === 'nebula') {
+        const hand1 = results.multiHandLandmarks[0];
+        const hand2 = results.multiHandLandmarks[1];
+        handleTwoHandPinch(hand1, hand2);
+        return;
+    }
+
+    // Reset two-hand state
+    state.isTwoHandPinch = false;
 
     const landmarks = results.multiHandLandmarks[0];
 
@@ -519,6 +545,55 @@ function onHandResults(results) {
     // Handle palm movement for nebula rotation
     if (gesture === 'palm' && state.currentMode === 'nebula') {
         handlePalmMovement();
+    }
+}
+
+function handleTwoHandPinch(hand1, hand2) {
+    // Get index finger tips from both hands
+    const indexTip1 = hand1[8];
+    const indexTip2 = hand2[8];
+
+    // Get thumb tips from both hands for pinch detection
+    const thumbTip1 = hand1[4];
+    const thumbTip2 = hand2[4];
+
+    // Calculate pinch distance for each hand (thumb to index)
+    const pinchDist1 = Math.sqrt(
+        Math.pow(indexTip1.x - thumbTip1.x, 2) +
+        Math.pow(indexTip1.y - thumbTip1.y, 2)
+    );
+    const pinchDist2 = Math.sqrt(
+        Math.pow(indexTip2.x - thumbTip2.x, 2) +
+        Math.pow(indexTip2.y - thumbTip2.y, 2)
+    );
+
+    // Check if both hands are in pinch gesture
+    const isPinch1 = pinchDist1 < 0.08;
+    const isPinch2 = pinchDist2 < 0.08;
+
+    if (isPinch1 && isPinch2) {
+        state.isTwoHandPinch = true;
+
+        // Calculate distance between the two pinch points
+        const handsDistance = Math.sqrt(
+            Math.pow(indexTip1.x - indexTip2.x, 2) +
+            Math.pow(indexTip1.y - indexTip2.y, 2)
+        );
+
+        // Map distance to spread factor (0.3 to 2.5)
+        // Closer = smaller spread, farther = larger spread
+        const minDist = 0.1;
+        const maxDist = 0.6;
+        const normalizedDist = Math.max(0, Math.min(1, (handsDistance - minDist) / (maxDist - minDist)));
+        const newSpread = 0.3 + normalizedDist * 2.2;
+
+        state.targetNebulaSpread = newSpread;
+
+        // Update indicator with spread percentage
+        const spreadPercent = Math.round((newSpread - 0.3) / 2.2 * 100);
+        updateGestureIndicator('🤏', `扩散范围: ${spreadPercent}%`);
+    } else {
+        state.isTwoHandPinch = false;
     }
 }
 
@@ -663,20 +738,30 @@ function transitionToNebula() {
 
     hideModals();
 
-    const targetPositions = particleSystem.geometry.attributes.targetPosition.array;
+    // Reset spread to default
+    state.nebulaSpread = 1.0;
+    state.targetNebulaSpread = 1.0;
 
-    for (let i = 0; i < PARTICLE_COUNT; i++) {
-        const nebulaPos = getNebulaPosition();
-        targetPositions[i * 3] = nebulaPos.x;
-        targetPositions[i * 3 + 1] = nebulaPos.y;
-        targetPositions[i * 3 + 2] = nebulaPos.z;
-    }
-
-    particleSystem.geometry.attributes.targetPosition.needsUpdate = true;
+    updateNebulaSpread();
 
     // Hide star
     const star = scene.getObjectByName('star');
     if (star) star.visible = false;
+}
+
+function updateNebulaSpread() {
+    if (state.currentMode !== 'nebula') return;
+
+    const targetPositions = particleSystem.geometry.attributes.targetPosition.array;
+    const spread = state.nebulaSpread;
+
+    for (let i = 0; i < PARTICLE_COUNT; i++) {
+        targetPositions[i * 3] = initialNebulaPositions[i * 3] * spread;
+        targetPositions[i * 3 + 1] = initialNebulaPositions[i * 3 + 1] * spread;
+        targetPositions[i * 3 + 2] = initialNebulaPositions[i * 3 + 2] * spread;
+    }
+
+    particleSystem.geometry.attributes.targetPosition.needsUpdate = true;
 }
 
 // ===== Photo & Letter Functions =====
@@ -816,6 +901,9 @@ function animate() {
     // Update shader time
     particleMaterial.uniforms.time.value = time;
 
+    // Smooth nebula spread updates
+    updateNebulaSpreadSmooth();
+
     // Smooth particle transitions
     updateParticlePositions();
 
@@ -823,6 +911,19 @@ function animate() {
     applyTransformations(time);
 
     renderer.render(scene, camera);
+}
+
+function updateNebulaSpreadSmooth() {
+    if (state.currentMode !== 'nebula') return;
+
+    // Smoothly interpolate current spread towards target
+    const spreadSmoothing = 0.15;
+    const spreadDiff = state.targetNebulaSpread - state.nebulaSpread;
+
+    if (Math.abs(spreadDiff) > 0.001) {
+        state.nebulaSpread += spreadDiff * spreadSmoothing;
+        updateNebulaSpread();
+    }
 }
 
 function updateParticlePositions() {
